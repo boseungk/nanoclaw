@@ -4,6 +4,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  AGENT_RUNTIME,
   DATA_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
@@ -60,10 +61,10 @@ function loadState(): void {
     logger.warn('Corrupted last_agent_timestamp in DB, resetting');
     lastAgentTimestamp = {};
   }
-  sessions = getAllSessions();
+  sessions = getAllSessions(AGENT_RUNTIME);
   registeredGroups = getAllRegisteredGroups();
   logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
+    { groupCount: Object.keys(registeredGroups).length, runtime: AGENT_RUNTIME },
     'State loaded',
   );
 }
@@ -248,7 +249,7 @@ async function runAgent(
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
           sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          setSession(group.folder, output.newSessionId, AGENT_RUNTIME);
         }
         await onOutput(output);
       }
@@ -263,6 +264,7 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
+        runtime: AGENT_RUNTIME,
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
@@ -270,7 +272,7 @@ async function runAgent(
 
     if (output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      setSession(group.folder, output.newSessionId, AGENT_RUNTIME);
     }
 
     if (output.status === 'error') {

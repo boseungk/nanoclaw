@@ -1,4 +1,5 @@
 import path from 'path';
+import { AgentRuntime } from './types.js';
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Andy';
 export const POLL_INTERVAL = 2000;
@@ -39,6 +40,14 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
 );
+
+function parseAgentRuntime(value: string | undefined): AgentRuntime {
+  if (!value) return 'claude';
+  return value.toLowerCase() === 'codex' ? 'codex' : 'claude';
+}
+
+export const AGENT_RUNTIME = parseAgentRuntime(process.env.AGENT_RUNTIME);
+export const CODEX_MODEL = process.env.CODEX_MODEL;
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

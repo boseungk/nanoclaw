@@ -30,6 +30,32 @@ claude
 
 Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup, service configuration.
 
+### Runtime Selection
+
+NanoClaw defaults to Claude Code runtime. You can switch agent runtime with environment variables:
+
+```bash
+# .env
+AGENT_RUNTIME=codex
+```
+
+Then authenticate Codex on the host:
+
+```bash
+codex login --device-auth
+```
+
+NanoClaw syncs `~/.codex/auth.json` into each group's container session automatically, so OAuth-only auth works without `OPENAI_API_KEY`.
+
+Optional fallback:
+
+```bash
+OPENAI_API_KEY=your_openai_api_key
+CODEX_MODEL=gpt-5-codex
+```
+
+Set `AGENT_RUNTIME=claude` (default) to keep Claude runtime behavior.
+
 ## Philosophy
 
 **Small enough to understand.** One process, a few source files. No microservices, no message queues, no abstraction layers. Have Claude Code walk you through it.

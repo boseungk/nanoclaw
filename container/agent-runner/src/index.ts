@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -26,6 +27,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  runtime?: 'claude' | 'codex';
   secrets?: Record<string, string>;
 }
 
@@ -187,7 +189,14 @@ function createPreCompactHook(): HookCallback {
 // Secrets to strip from Bash tool subprocess environments.
 // These are needed by claude-code for API auth but should never
 // be visible to commands Kit runs.
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+const SECRET_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
+  'OPENAI_ORG_ID',
+  'OPENAI_PROJECT_ID',
+];
 
 function createSanitizeBashHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -353,7 +362,7 @@ function waitForIpcMessage(): Promise<string | null> {
  * allowing agent teams subagents to run to completion.
  * Also pipes IPC messages into the stream during the query.
  */
-async function runQuery(
+async function runClaudeQuery(
   prompt: string,
   sessionId: string | undefined,
   mcpServerPath: string,
@@ -489,6 +498,223 @@ async function runQuery(
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
+interface QueryRunResult {
+  newSessionId?: string;
+  lastAssistantUuid?: string;
+  closedDuringQuery: boolean;
+}
+
+function tomlString(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function buildCodexArgs(
+  sessionId: string | undefined,
+  mcpServerPath: string,
+  containerInput: ContainerInput,
+  codexModel?: string,
+): string[] {
+  const args = sessionId
+    ? ['exec', 'resume', sessionId, '-']
+    : ['exec', '-'];
+
+  args.push(
+    '--json',
+    '--dangerously-bypass-approvals-and-sandbox',
+    '--skip-git-repo-check',
+  );
+
+  if (codexModel) {
+    args.push('--model', codexModel);
+  }
+
+  if (!sessionId) {
+    if (fs.existsSync('/workspace/project')) {
+      args.push('--add-dir', '/workspace/project');
+    }
+    const extraBase = '/workspace/extra';
+    if (fs.existsSync(extraBase)) {
+      for (const entry of fs.readdirSync(extraBase)) {
+        const fullPath = path.join(extraBase, entry);
+        if (fs.statSync(fullPath).isDirectory()) {
+          args.push('--add-dir', fullPath);
+        }
+      }
+    }
+  }
+
+  args.push('-c', 'mcp_servers.nanoclaw.command="node"');
+  args.push(
+    '-c',
+    `mcp_servers.nanoclaw.args=[${tomlString(mcpServerPath)}]`,
+  );
+  args.push(
+    '-c',
+    `mcp_servers.nanoclaw.env={NANOCLAW_CHAT_JID=${tomlString(
+      containerInput.chatJid,
+    )},NANOCLAW_GROUP_FOLDER=${tomlString(
+      containerInput.groupFolder,
+    )},NANOCLAW_IS_MAIN=${tomlString(containerInput.isMain ? '1' : '0')}}`,
+  );
+
+  return args;
+}
+
+function addGlobalMemoryForCodex(
+  prompt: string,
+  containerInput: ContainerInput,
+  sessionId: string | undefined,
+): string {
+  if (sessionId) return prompt;
+  if (containerInput.isMain) return prompt;
+  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  if (!fs.existsSync(globalClaudeMdPath)) return prompt;
+  const globalMemory = fs.readFileSync(globalClaudeMdPath, 'utf-8').trim();
+  if (!globalMemory) return prompt;
+
+  return [
+    '[GLOBAL MEMORY]',
+    'This context applies to all groups:',
+    globalMemory,
+    '',
+    '[USER MESSAGE]',
+    prompt,
+  ].join('\n');
+}
+
+async function runCodexQuery(
+  prompt: string,
+  sessionId: string | undefined,
+  mcpServerPath: string,
+  containerInput: ContainerInput,
+  env: Record<string, string | undefined>,
+): Promise<QueryRunResult> {
+  if (shouldClose()) {
+    return { newSessionId: sessionId, closedDuringQuery: true };
+  }
+
+  const codexPrompt = addGlobalMemoryForCodex(prompt, containerInput, sessionId);
+  const codexModel = env.CODEX_MODEL || process.env.CODEX_MODEL;
+  const args = buildCodexArgs(
+    sessionId,
+    mcpServerPath,
+    containerInput,
+    codexModel,
+  );
+  log(`Running Codex CLI: codex ${args.join(' ')}`);
+
+  return new Promise<QueryRunResult>((resolve, reject) => {
+    const proc = spawn('codex', args, {
+      cwd: '/workspace/group',
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    proc.stdin.write(codexPrompt);
+    proc.stdin.end();
+
+    let stdoutBuf = '';
+    let newSessionId = sessionId;
+    let hadOutput = false;
+    let lastError = '';
+    let closedDuringQuery = false;
+
+    const closePoll = setInterval(() => {
+      if (shouldClose()) {
+        closedDuringQuery = true;
+        proc.kill('SIGTERM');
+      }
+    }, IPC_POLL_MS);
+
+    const processLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      try {
+        const evt = JSON.parse(trimmed) as {
+          type?: string;
+          thread_id?: string;
+          error?: { message?: string } | string;
+          item?: { type?: string; text?: string };
+        };
+
+        if (evt.type === 'thread.started' && evt.thread_id) {
+          newSessionId = evt.thread_id;
+          return;
+        }
+
+        if (evt.type === 'item.completed' && evt.item?.type === 'agent_message') {
+          const text = evt.item.text?.trim();
+          if (text) {
+            hadOutput = true;
+            writeOutput({
+              status: 'success',
+              result: text,
+              newSessionId,
+            });
+          }
+          return;
+        }
+
+        if (evt.type === 'error') {
+          lastError = typeof evt.error === 'string'
+            ? evt.error
+            : evt.error?.message || 'Unknown Codex error';
+        }
+      } catch {
+        // Codex can emit non-JSON diagnostic lines; ignore them.
+      }
+    };
+
+    proc.stdout.on('data', (chunk) => {
+      stdoutBuf += chunk.toString();
+      while (true) {
+        const nl = stdoutBuf.indexOf('\n');
+        if (nl === -1) break;
+        const line = stdoutBuf.slice(0, nl);
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        processLine(line);
+      }
+    });
+
+    proc.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      for (const line of text.trim().split('\n')) {
+        if (line) log(`[codex] ${line}`);
+      }
+    });
+
+    proc.on('error', (err) => {
+      clearInterval(closePoll);
+      reject(err);
+    });
+
+    proc.on('close', (code) => {
+      clearInterval(closePoll);
+      if (stdoutBuf.trim()) {
+        processLine(stdoutBuf);
+      }
+      if (closedDuringQuery) {
+        resolve({ newSessionId, closedDuringQuery: true });
+        return;
+      }
+      if (code !== 0) {
+        reject(
+          new Error(
+            `Codex CLI exited with code ${code}${
+              lastError ? `: ${lastError}` : ''
+            }`,
+          ),
+        );
+        return;
+      }
+      if (!hadOutput) {
+        log('Codex completed with no agent_message output');
+      }
+      resolve({ newSessionId, closedDuringQuery: false });
+    });
+  });
+}
+
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
@@ -497,7 +723,12 @@ async function main(): Promise<void> {
     containerInput = JSON.parse(stdinData);
     // Delete the temp file the entrypoint wrote — it contains secrets
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+    containerInput.runtime = containerInput.runtime === 'codex'
+      ? 'codex'
+      : 'claude';
+    log(
+      `Received input for group: ${containerInput.groupFolder} (runtime: ${containerInput.runtime})`,
+    );
   } catch (err) {
     writeOutput({
       status: 'error',
@@ -507,8 +738,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Build SDK env: merge secrets into process.env for the SDK only.
-  // Secrets never touch process.env itself, so Bash subprocesses can't see them.
+  // Build runtime env: merge secrets into process.env only for subprocesses.
+  // Secrets never touch process.env itself, so Bash subprocesses can't see them
+  // unless explicitly inherited by the selected runtime command.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
     sdkEnv[key] = value;
@@ -538,13 +770,32 @@ async function main(): Promise<void> {
   let resumeAt: string | undefined;
   try {
     while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
+      log(
+        `Starting query (runtime: ${containerInput.runtime}, session: ${
+          sessionId || 'new'
+        }, resumeAt: ${resumeAt || 'latest'})...`,
+      );
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = containerInput.runtime === 'codex'
+        ? await runCodexQuery(
+          prompt,
+          sessionId,
+          mcpServerPath,
+          containerInput,
+          sdkEnv,
+        )
+        : await runClaudeQuery(
+          prompt,
+          sessionId,
+          mcpServerPath,
+          containerInput,
+          sdkEnv,
+          resumeAt,
+        );
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
-      if (queryResult.lastAssistantUuid) {
+      if (containerInput.runtime === 'claude' && queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
       }
 

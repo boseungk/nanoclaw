@@ -4,10 +4,10 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import {
+  AGENT_RUNTIME,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -17,21 +17,11 @@ import {
 } from './config.js';
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
-import { RegisteredGroup } from './types.js';
+import { AgentRuntime, RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-
-function getHomeDir(): string {
-  const home = process.env.HOME || os.homedir();
-  if (!home) {
-    throw new Error(
-      'Unable to determine home directory: HOME environment variable is not set and os.homedir() returned empty',
-    );
-  }
-  return home;
-}
 
 export interface ContainerInput {
   prompt: string;
@@ -40,6 +30,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  runtime?: AgentRuntime;
   secrets?: Record<string, string>;
 }
 
@@ -56,12 +47,125 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+let codexAuthMissingWarned = false;
+
+function syncCodexAuth(codexHome: string): void {
+  const hostHome = process.env.HOME;
+  if (!hostHome) return;
+
+  const hostCodexDir = path.join(hostHome, '.codex');
+  const hostAuthFile = path.join(hostCodexDir, 'auth.json');
+  const groupAuthFile = path.join(codexHome, 'auth.json');
+
+  if (!fs.existsSync(hostAuthFile)) {
+    if (!codexAuthMissingWarned) {
+      codexAuthMissingWarned = true;
+      logger.warn(
+        { hostAuthFile },
+        'Codex runtime selected but no OAuth session file found on host',
+      );
+    }
+    return;
+  }
+
+  fs.copyFileSync(hostAuthFile, groupAuthFile);
+  try {
+    fs.chmodSync(groupAuthFile, 0o600);
+  } catch {
+    // Best effort on non-POSIX filesystems.
+  }
+
+  // Optional compatibility file (may not exist depending on Codex version).
+  const hostCredentialsFile = path.join(hostCodexDir, '.credentials.json');
+  if (fs.existsSync(hostCredentialsFile)) {
+    const groupCredentialsFile = path.join(codexHome, '.credentials.json');
+    fs.copyFileSync(hostCredentialsFile, groupCredentialsFile);
+    try {
+      fs.chmodSync(groupCredentialsFile, 0o600);
+    } catch {
+      // Best effort on non-POSIX filesystems.
+    }
+  }
+}
+
+function ensureClaudeSessionHome(groupFolder: string): string {
+  const claudeHome = path.join(DATA_DIR, 'sessions', groupFolder, '.claude');
+  fs.mkdirSync(claudeHome, { recursive: true });
+
+  const settingsFile = path.join(claudeHome, 'settings.json');
+  if (!fs.existsSync(settingsFile)) {
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify(
+        {
+          env: {
+            // Enable agent swarms (subagent orchestration)
+            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+            // Load CLAUDE.md from additional mounted directories
+            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+            // Enable Claude's memory feature (persists user preferences between sessions)
+            // https://code.claude.com/docs/en/memory#manage-auto-memory
+            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+  }
+
+  // Sync skills from container/skills/ into each group's .claude/skills/
+  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  const skillsDst = path.join(claudeHome, 'skills');
+  if (fs.existsSync(skillsSrc)) {
+    for (const skillDir of fs.readdirSync(skillsSrc)) {
+      const srcDir = path.join(skillsSrc, skillDir);
+      if (!fs.statSync(srcDir).isDirectory()) continue;
+      const dstDir = path.join(skillsDst, skillDir);
+      fs.mkdirSync(dstDir, { recursive: true });
+      for (const file of fs.readdirSync(srcDir)) {
+        fs.copyFileSync(path.join(srcDir, file), path.join(dstDir, file));
+      }
+    }
+  }
+
+  return claudeHome;
+}
+
+function ensureCodexSessionHome(groupFolder: string): string {
+  const codexHome = path.join(DATA_DIR, 'sessions', groupFolder, '.codex');
+  fs.mkdirSync(codexHome, { recursive: true });
+
+  const configFile = path.join(codexHome, 'config.toml');
+  if (!fs.existsSync(configFile)) {
+    // Keep defaults minimal; runtime overrides (MCP/env/model) are passed
+    // per invocation from the container-side runner.
+    fs.writeFileSync(
+      configFile,
+      [
+        'model_reasoning_effort = "high"',
+        '',
+        '[sandbox_workspace_write]',
+        'network_access = true',
+        '',
+      ].join('\n'),
+    );
+  }
+
+  // Keep host Codex OAuth session in sync for API-key-free auth.
+  syncCodexAuth(codexHome);
+
+  return codexHome;
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  runtime: AgentRuntime,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
-  const homeDir = getHomeDir();
   const projectRoot = process.cwd();
 
   if (isMain) {
@@ -98,53 +202,21 @@ function buildVolumeMounts(
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
-  fs.mkdirSync(groupSessionsDir, { recursive: true });
-  const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(settingsFile, JSON.stringify({
-      env: {
-        // Enable agent swarms (subagent orchestration)
-        // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-        // Load CLAUDE.md from additional mounted directories
-        // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-        CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-        // Enable Claude's memory feature (persists user preferences between sessions)
-        // https://code.claude.com/docs/en/memory#manage-auto-memory
-        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-      },
-    }, null, 2) + '\n');
+  if (runtime === 'codex') {
+    const codexHome = ensureCodexSessionHome(group.folder);
+    mounts.push({
+      hostPath: codexHome,
+      containerPath: '/home/node/.codex',
+      readonly: false,
+    });
+  } else {
+    const claudeHome = ensureClaudeSessionHome(group.folder);
+    mounts.push({
+      hostPath: claudeHome,
+      containerPath: '/home/node/.claude',
+      readonly: false,
+    });
   }
-
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
-  const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.mkdirSync(dstDir, { recursive: true });
-      for (const file of fs.readdirSync(srcDir)) {
-        const srcFile = path.join(srcDir, file);
-        const dstFile = path.join(dstDir, file);
-        fs.copyFileSync(srcFile, dstFile);
-      }
-    }
-  }
-  mounts.push({
-    hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
-    readonly: false,
-  });
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -188,7 +260,15 @@ function readSecrets(): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
   if (!fs.existsSync(envFile)) return {};
 
-  const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+  const allowedVars = [
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
+    'OPENAI_ORG_ID',
+    'OPENAI_PROJECT_ID',
+    'CODEX_MODEL',
+  ];
   const secrets: Record<string, string> = {};
   const content = fs.readFileSync(envFile, 'utf-8');
 
@@ -239,11 +319,13 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+  const runtime = input.runtime || AGENT_RUNTIME;
+  input.runtime = runtime;
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMounts(group, input.isMain, runtime);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
@@ -252,6 +334,7 @@ export async function runContainerAgent(
     {
       group: group.name,
       containerName,
+      runtime,
       mounts: mounts.map(
         (m) =>
           `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
@@ -265,6 +348,7 @@ export async function runContainerAgent(
     {
       group: group.name,
       containerName,
+      runtime,
       mountCount: mounts.length,
       isMain: input.isMain,
     },

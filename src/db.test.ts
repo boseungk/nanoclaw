@@ -5,9 +5,12 @@ import {
   createTask,
   deleteTask,
   getAllChats,
+  getAllSessions,
   getMessagesSince,
   getNewMessages,
+  getSession,
   getTaskById,
+  setSession,
   storeChatMetadata,
   storeMessage,
   updateTask,
@@ -311,5 +314,25 @@ describe('task CRUD', () => {
 
     deleteTask('task-3');
     expect(getTaskById('task-3')).toBeUndefined();
+  });
+});
+
+// --- Runtime sessions ---
+
+describe('runtime sessions', () => {
+  it('stores independent session ids per runtime', () => {
+    setSession('main', 'claude-session', 'claude');
+    setSession('main', 'codex-session', 'codex');
+
+    expect(getSession('main', 'claude')).toBe('claude-session');
+    expect(getSession('main', 'codex')).toBe('codex-session');
+  });
+
+  it('returns sessions filtered by runtime', () => {
+    setSession('group-a', 'claude-a', 'claude');
+    setSession('group-b', 'codex-b', 'codex');
+
+    expect(getAllSessions('claude')).toEqual({ 'group-a': 'claude-a' });
+    expect(getAllSessions('codex')).toEqual({ 'group-b': 'codex-b' });
   });
 });

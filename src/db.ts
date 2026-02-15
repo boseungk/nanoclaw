@@ -3,7 +3,13 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, STORE_DIR } from './config.js';
-import { NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
+import {
+  AgentRuntime,
+  NewMessage,
+  RegisteredGroup,
+  ScheduledTask,
+  TaskRunLog,
+} from './types.js';
 
 let db: Database.Database;
 
@@ -62,6 +68,12 @@ function createSchema(database: Database.Database): void {
     CREATE TABLE IF NOT EXISTS sessions (
       group_folder TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS runtime_sessions (
+      group_folder TEXT NOT NULL,
+      runtime TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      PRIMARY KEY (group_folder, runtime)
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
@@ -426,27 +438,73 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
-  const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
-  return row?.session_id;
+export function getSession(
+  groupFolder: string,
+  runtime: AgentRuntime = 'claude',
+): string | undefined {
+  const runtimeRow = db
+    .prepare(
+      'SELECT session_id FROM runtime_sessions WHERE group_folder = ? AND runtime = ?',
+    )
+    .get(groupFolder, runtime) as { session_id: string } | undefined;
+  if (runtimeRow?.session_id) return runtimeRow.session_id;
+
+  // Backwards compatibility for existing installations that only have
+  // the legacy sessions table (Claude runtime only).
+  if (runtime === 'claude') {
+    const legacyRow = db
+      .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
+      .get(groupFolder) as { session_id: string } | undefined;
+    return legacyRow?.session_id;
+  }
+
+  return undefined;
 }
 
-export function setSession(groupFolder: string, sessionId: string): void {
+export function setSession(
+  groupFolder: string,
+  sessionId: string,
+  runtime: AgentRuntime = 'claude',
+): void {
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
+    `INSERT OR REPLACE INTO runtime_sessions (group_folder, runtime, session_id)
+     VALUES (?, ?, ?)`,
+  ).run(groupFolder, runtime, sessionId);
+
+  // Keep legacy table in sync for Claude so older code/tools still work.
+  if (runtime === 'claude') {
+    db.prepare(
+      'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    ).run(groupFolder, sessionId);
+  }
 }
 
-export function getAllSessions(): Record<string, string> {
-  const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
+export function getAllSessions(
+  runtime: AgentRuntime = 'claude',
+): Record<string, string> {
+  const runtimeRows = db
+    .prepare(
+      'SELECT group_folder, session_id FROM runtime_sessions WHERE runtime = ?',
+    )
+    .all(runtime) as Array<{ group_folder: string; session_id: string }>;
+
   const result: Record<string, string> = {};
-  for (const row of rows) {
+  for (const row of runtimeRows) {
     result[row.group_folder] = row.session_id;
   }
+
+  // Backwards compatibility for existing Claude sessions.
+  if (runtime === 'claude') {
+    const legacyRows = db
+      .prepare('SELECT group_folder, session_id FROM sessions')
+      .all() as Array<{ group_folder: string; session_id: string }>;
+    for (const row of legacyRows) {
+      if (!result[row.group_folder]) {
+        result[row.group_folder] = row.session_id;
+      }
+    }
+  }
+
   return result;
 }
 
@@ -567,7 +625,7 @@ function migrateJsonState(): void {
   > | null;
   if (sessions) {
     for (const [folder, sessionId] of Object.entries(sessions)) {
-      setSession(folder, sessionId);
+      setSession(folder, sessionId, 'claude');
     }
   }
 

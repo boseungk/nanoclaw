@@ -4,6 +4,8 @@ export interface AdditionalMount {
   readonly?: boolean; // Default: true for safety
 }
 
+export type AgentRuntime = 'claude' | 'codex';
+
 /**
  * Mount Allowlist - Security configuration for additional mounts
  * This file should be stored at ~/.config/nanoclaw/mount-allowlist.json
